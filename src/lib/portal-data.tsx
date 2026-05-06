@@ -516,22 +516,64 @@ function resolveAttachmentSourceType(payload: AttachmentInput): AttachmentSource
   return "METADATA";
 }
 
-function createAttachment(payload: AttachmentInput, uploadedBy: string, version = 1): AttachmentRef {
+function normalizeAttachmentKey(value?: string) {
+  return (value || "").trim().toLowerCase();
+}
+
+function getAttachmentKeyFromInput(payload: AttachmentInput) {
+  return normalizeAttachmentKey(payload.fileName || payload.name);
+}
+
+function getAttachmentKeyFromRef(attachment: AttachmentRef) {
+  return normalizeAttachmentKey(attachment.fileName || attachment.name);
+}
+
+function getAutoAttachmentName(payload: AttachmentInput) {
+  if (payload.fileName?.trim()) return payload.fileName.trim();
+  if (payload.name?.trim()) return payload.name.trim();
+
+  if (payload.textContent?.trim()) {
+    return `Text Document - ${new Date().toISOString().slice(0, 19).replace("T", " ")}`;
+  }
+
+  return "Untitled document";
+}
+
+function getNextAttachmentVersion(existingAttachments: AttachmentRef[], payload: AttachmentInput) {
+  const key = getAttachmentKeyFromInput({
+    ...payload,
+    name: getAutoAttachmentName(payload),
+  });
+
+  if (!key) return 1;
+
+  const matchingVersions = existingAttachments
+    .filter((attachment) => getAttachmentKeyFromRef(attachment) === key)
+    .map((attachment) => attachment.version || 1);
+
+  if (!matchingVersions.length) return 1;
+  return Math.max(...matchingVersions) + 1;
+}
+
+function createAttachment(payload: AttachmentInput, uploadedBy: string, existingAttachments: AttachmentRef[] = []): AttachmentRef {
+  const autoName = getAutoAttachmentName(payload);
+  const nextVersion = getNextAttachmentVersion(existingAttachments, { ...payload, name: autoName });
+
   return {
     id: uid("att"),
-    name: payload.name.trim() || payload.fileName || "Untitled document",
+    name: autoName,
     category: payload.category,
     uploadedBy,
     uploadedAt: now(),
     sourceType: resolveAttachmentSourceType(payload),
     textContent: payload.textContent?.trim() || undefined,
-    fileName: payload.fileName || undefined,
+    fileName: payload.fileName?.trim() || undefined,
     fileType: payload.fileType || undefined,
     fileSize: payload.fileSize || undefined,
     fileDataUrl: payload.fileDataUrl || undefined,
     workflowStage: payload.workflowStage || "Project / Bid Intake",
     note: payload.note?.trim() || undefined,
-    version,
+    version: nextVersion,
   };
 }
 
@@ -601,6 +643,11 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
     const count = state.projects.length + 1;
     const code = payload.type === "BID" ? `BID-${26000 + count}` : `PRJ-${26000 + count}`;
 
+    const initialDocuments: AttachmentRef[] = [];
+    payload.initialDocuments.forEach((doc) => {
+      initialDocuments.push(createAttachment({ ...doc, workflowStage: doc.workflowStage || "Project / Bid Intake" }, actorLabel(), initialDocuments));
+    });
+
     const project: ProjectItem = {
       id: uid("project"),
       code,
@@ -611,9 +658,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       originDivisionId: "div-ccr",
       sourceChannel: payload.sourceChannel,
       status: payload.type === "BID" ? "BIDDING" : "ACTIVE",
-      initialDocuments: payload.initialDocuments.map((doc, index) =>
-        createAttachment({ ...doc, workflowStage: doc.workflowStage || "Project / Bid Intake" }, actorLabel(), index + 1)
-      ),
+      initialDocuments,
       credentialsSent: true,
       createdAt: now(),
     };
@@ -631,11 +676,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
               ...project,
               initialDocuments: [
                 ...project.initialDocuments,
-                createAttachment(
-                  { ...payload, workflowStage: payload.workflowStage || "Workflow Collaboration" },
-                  actorLabel(),
-                  project.initialDocuments.length + 1
-                ),
+                createAttachment({ ...payload, workflowStage: payload.workflowStage || "Workflow Collaboration" }, actorLabel(), project.initialDocuments),
               ],
             }
           : project
@@ -655,7 +696,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       const attachment = createAttachment(
         { ...payload, workflowStage: payload.workflowStage || getWorkRequestStatusLabel(request.currentStatus) },
         actorLabel(),
-        project.initialDocuments.length + 1
+        project.initialDocuments
       );
 
       project.initialDocuments.push(attachment);
@@ -663,7 +704,7 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
         id: uid("hist"),
         at: now(),
         by: actorLabel(),
-        action: `Uploaded document ${attachment.name}`,
+        action: `Uploaded document ${attachment.name} v${attachment.version || 1}`,
         to: attachment.workflowStage,
         note: attachment.note,
       });

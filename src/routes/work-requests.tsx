@@ -98,10 +98,23 @@ function formatFileSize(size?: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function autoDocumentName(doc: DocumentFormRow) {
+  if (doc.fileName?.trim()) return doc.fileName.trim();
+  if (doc.name?.trim()) return doc.name.trim();
+
+  if (doc.textContent?.trim()) {
+    return `Text Document - ${new Date().toISOString().slice(0, 19).replace("T", " ")}`;
+  }
+
+  return "";
+}
+
 function normalizeDocument(doc: DocumentFormRow) {
+  const normalizedName = autoDocumentName(doc);
+
   const normalized = {
     ...doc,
-    name: doc.name.trim() || doc.fileName || "Untitled document",
+    name: normalizedName,
     textContent: doc.textContent?.trim() || undefined,
     note: doc.note?.trim() || undefined,
   };
@@ -508,7 +521,7 @@ function WorkRequestsPage() {
       const fileDataUrl = await readFileAsDataUrl(file);
       setUploadDoc((prev) => ({
         ...prev,
-        name: prev.name || file.name,
+        name: file.name,
         fileName: file.name,
         fileType: file.type || "application/octet-stream",
         fileSize: file.size,
@@ -526,7 +539,7 @@ function WorkRequestsPage() {
       const fileDataUrl = await readFileAsDataUrl(file);
       setActionDoc((prev) => ({
         ...prev,
-        name: prev.name || file.name,
+        name: file.name,
         fileName: file.name,
         fileType: file.type || "application/octet-stream",
         fileSize: file.size,
@@ -543,7 +556,7 @@ function WorkRequestsPage() {
 
     addWorkRequestDocument(request.id, normalized);
     toast.success("Document uploaded", {
-      description: "The original file is stored and available in the request details for authorized users.",
+      description: "The document name is auto-set from the uploaded file. Duplicate file names are saved as a new version.",
     });
 
     setUploadDoc(createEmptyDocumentRow(state.settings.categories[0] || "General"));
@@ -568,7 +581,7 @@ function WorkRequestsPage() {
     action();
     setReviewNote("");
     toast.success(message, {
-      description: attached ? "Optional document was attached with this workflow action." : undefined,
+      description: attached ? "Optional document was attached. Same file names are saved as a new version." : undefined,
     });
   };
 
@@ -581,24 +594,37 @@ function WorkRequestsPage() {
     setShowListDialog(request.id);
   };
 
+  const renderAutoNamePreview = (doc: DocumentFormRow) => {
+    const name = autoDocumentName(doc);
+
+    if (name) {
+      return (
+        <div className="rounded-lg border border-border bg-background px-3 py-2 text-sm font-medium text-foreground">
+          {name}
+        </div>
+      );
+    }
+
+    return (
+      <div className="rounded-lg border border-dashed border-border bg-background px-3 py-2 text-sm text-muted-foreground">
+        File name will be used automatically after upload. Text-only documents will get an automatic timestamp name.
+      </div>
+    );
+  };
+
   const renderOptionalActionUploadFields = () => (
     <div className="rounded-xl border border-border bg-muted/20 p-4">
       <div className="mb-3">
         <h4 className="text-sm font-semibold text-card-foreground">Optional File Attachment for This Action</h4>
         <p className="text-xs text-muted-foreground">
-          Attach a file or text document while submitting, approving, forwarding, or sending backward. Leave empty if no document is needed.
+          Upload any file type or add a text document. File name is set automatically from the uploaded file. Same file name becomes next version.
         </p>
       </div>
 
       <div className="grid gap-3 md:grid-cols-2">
-        <div>
-          <label className="mb-1 block text-xs font-medium text-muted-foreground">Document Title</label>
-          <input
-            value={actionDoc.name}
-            onChange={(event) => setActionDoc((prev) => ({ ...prev, name: event.target.value }))}
-            placeholder="Document title or file name"
-            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-          />
+        <div className="md:col-span-2">
+          <label className="mb-1 block text-xs font-medium text-muted-foreground">Document Name</label>
+          {renderAutoNamePreview(actionDoc)}
         </div>
 
         <div>
@@ -631,7 +657,7 @@ function WorkRequestsPage() {
           </select>
         </div>
 
-        <div>
+        <div className="md:col-span-2">
           <label className="mb-1 block text-xs font-medium text-muted-foreground">Upload File</label>
           <input
             type="file"
@@ -650,7 +676,7 @@ function WorkRequestsPage() {
           <textarea
             value={actionDoc.textContent || ""}
             onChange={(event) => setActionDoc((prev) => ({ ...prev, textContent: event.target.value }))}
-            placeholder="Write or paste text document here."
+            placeholder="Write or paste text document here. Name will be generated automatically if no file is uploaded."
             rows={3}
             className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
           />
@@ -1417,19 +1443,14 @@ function WorkRequestsPage() {
                 <div className="mb-3">
                   <h4 className="text-sm font-semibold text-card-foreground">Upload Updated File / Text Document</h4>
                   <p className="text-xs text-muted-foreground">
-                    This modal is only for uploading. Previous files are available from the Details modal.
+                    File name is set automatically from the uploaded file. Same file name becomes next version.
                   </p>
                 </div>
 
                 <div className="grid gap-3 md:grid-cols-2">
-                  <div>
-                    <label className="mb-1 block text-xs font-medium text-muted-foreground">Document Title</label>
-                    <input
-                      value={uploadDoc.name}
-                      onChange={(event) => setUploadDoc((prev) => ({ ...prev, name: event.target.value }))}
-                      placeholder="Document title or file name"
-                      className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                    />
+                  <div className="md:col-span-2">
+                    <label className="mb-1 block text-xs font-medium text-muted-foreground">Document Name</label>
+                    {renderAutoNamePreview(uploadDoc)}
                   </div>
 
                   <div>
@@ -1462,7 +1483,7 @@ function WorkRequestsPage() {
                     </select>
                   </div>
 
-                  <div>
+                  <div className="md:col-span-2">
                     <label className="mb-1 block text-xs font-medium text-muted-foreground">Upload File</label>
                     <input
                       type="file"
@@ -1481,7 +1502,7 @@ function WorkRequestsPage() {
                     <textarea
                       value={uploadDoc.textContent || ""}
                       onChange={(event) => setUploadDoc((prev) => ({ ...prev, textContent: event.target.value }))}
-                      placeholder="Write or paste document text here."
+                      placeholder="Write or paste document text here. Name will be generated automatically if no file is uploaded."
                       rows={4}
                       className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                     />
