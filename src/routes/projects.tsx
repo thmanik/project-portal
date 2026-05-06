@@ -542,9 +542,9 @@ function ProjectsPage() {
             <div className="md:col-span-2 rounded-xl border border-border p-4">
               <div className="mb-3 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
-                  <h4 className="text-sm font-semibold text-card-foreground">Initial Documents</h4>
+                  <h4 className="text-sm font-semibold text-card-foreground">Primary File List</h4>
                   <p className="text-xs text-muted-foreground">
-                    Add a text document, upload any file type, or provide both. These files stay downloadable for authorized workflow users.
+                   CCR / Marketing uploads original client documents here. These files become the primary file list for this Bid / Project.
                   </p>
                 </div>
 
