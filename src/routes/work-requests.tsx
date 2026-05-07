@@ -73,7 +73,8 @@ type WorkflowAction =
   | "DIVISION_MEMBER_REVIEW"
   | "DIVISION_MANAGER_APPROVE"
   | "FORWARD_TO_CCR"
-  | "FINAL_LIST";
+  | "FINAL_LIST"
+  | "SEND_BACKWARD";
 
 type FileGroup = "PRIMARY" | "WORKFLOW";
 
@@ -147,6 +148,71 @@ function safeFileName(name: string) {
 
 function ensureTxtExtension(name: string) {
   return /\.[a-z0-9]+$/i.test(name) ? name : `${name}.txt`;
+}
+
+function getFileExtension(fileName?: string) {
+  if (!fileName) return "";
+  const cleanName = fileName.split("?")[0].split("#")[0];
+  const parts = cleanName.split(".");
+  if (parts.length < 2) return "";
+  return parts.pop()?.trim().toLowerCase() || "";
+}
+
+function getFileTypeKey(doc: AttachmentRef) {
+  const extension = getFileExtension(doc.fileName || doc.name);
+
+  if (extension) return extension;
+
+  if (doc.fileType?.includes("/")) {
+    const subtype = doc.fileType.split("/")[1]?.toLowerCase() || "";
+    return subtype.split(";")[0].split("+")[0] || "unknown";
+  }
+
+  if (doc.textContent && !doc.fileName) return "txt";
+
+  return "unknown";
+}
+
+function getFileTypeLabel(type: string) {
+  if (!type || type === "unknown") return "Unknown";
+  return type.toUpperCase();
+}
+
+function getUploadedDateKey(uploadedAt?: string) {
+  if (!uploadedAt) return "";
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(uploadedAt)) {
+    return uploadedAt.slice(0, 10);
+  }
+
+  const parsed = new Date(uploadedAt);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toISOString().slice(0, 10);
+}
+
+function isImageFile(doc: AttachmentRef) {
+  const type = doc.fileType?.toLowerCase() || "";
+  const ext = getFileTypeKey(doc);
+  return type.startsWith("image/") || ["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext);
+}
+
+function isPdfFile(doc: AttachmentRef) {
+  const type = doc.fileType?.toLowerCase() || "";
+  const ext = getFileTypeKey(doc);
+  return type === "application/pdf" || ext === "pdf";
+}
+
+function filterAttachmentFiles(files: AttachmentRef[], search: string, fileType: string, uploadDate: string) {
+  const normalizedSearch = search.trim().toLowerCase();
+
+  return files.filter((doc) => {
+    const fileName = `${doc.fileName || ""} ${doc.name || ""}`.toLowerCase();
+    const matchesSearch = !normalizedSearch || fileName.includes(normalizedSearch);
+    const matchesType = fileType === "ALL" || getFileTypeKey(doc) === fileType;
+    const matchesDate = !uploadDate || getUploadedDateKey(doc.uploadedAt) === uploadDate;
+
+    return matchesSearch && matchesType && matchesDate;
+  });
 }
 
 async function downloadAttachment(doc: AttachmentRef) {
@@ -282,6 +348,49 @@ function getDefaultActionUploadStage(status: WorkRequestStatus) {
   return "Workflow Collaboration";
 }
 
+function getBackwardTargetLabel(status: WorkRequestStatus) {
+  const map: Partial<Record<WorkRequestStatus, string>> = {
+    LEADER_ASSIGNED: "Division Notified",
+    MEMBER_REVIEW: "Division Lead Assignment",
+    FORWARDED_TO_TMS: "Division Member Review",
+    TMS_ASSIGNED: "TMS Manager Intake",
+    DRAWING_IN_PROGRESS: "TMS Chain Assignment",
+    CHECKING_REVIEW: "TMS-M1 Drawing Rework",
+    APPROVAL_REVIEW: "TMS-M2 Checking Rework",
+    RETURNED_TO_DIVISION: "TMS-M3 Approval Rework",
+    DIVISION_MEMBER_APPROVED: "Division Member Final Review",
+    DIVISION_MANAGER_APPROVED: "Division Member Approved Stage",
+    FORWARDED_TO_CCR: "Division Manager Approval",
+  };
+
+  return map[status];
+}
+
+function shouldShowGenericBackward(status: WorkRequestStatus) {
+  return !["CHECKING_REVIEW", "APPROVAL_REVIEW", "RETURNED_TO_DIVISION"].includes(status);
+}
+
+function getDocumentRevisionGroups(files: AttachmentRef[]) {
+  const groups = new Map<string, AttachmentRef[]>();
+
+  files.forEach((file) => {
+    const key = (file.fileName || file.name || "Untitled document").trim().toLowerCase();
+    const displayKey = key || file.id;
+    const existing = groups.get(displayKey) || [];
+    existing.push(file);
+    groups.set(displayKey, existing);
+  });
+
+  return [...groups.entries()]
+    .map(([key, items]) => ({
+      key,
+      name: items[0]?.fileName || items[0]?.name || "Untitled document",
+      revisions: items.sort((a, b) => (a.version || 1) - (b.version || 1)),
+      latestAt: items.reduce((latest, item) => (item.uploadedAt > latest ? item.uploadedAt : latest), items[0]?.uploadedAt || ""),
+    }))
+    .sort((a, b) => b.latestAt.localeCompare(a.latestAt));
+}
+
 function WorkRequestsPage() {
   const routeSearch = Route.useSearch();
   const appliedNotificationRouteRef = useRef("");
@@ -301,8 +410,12 @@ function WorkRequestsPage() {
     originMemberDecision,
     originManagerApprove,
     forwardToCcr,
+    sendBackward,
     listFinalDocument,
   } = usePortal();
+
+  const workRequestTypes = state.settings.workRequestTypes?.length ? state.settings.workRequestTypes : state.settings.categories;
+  const projectInfoCategories = state.settings.projectInfoCategories?.length ? state.settings.projectInfoCategories : state.settings.categories;
 
   const [search, setSearch] = useState("");
   const [showCreate, setShowCreate] = useState(false);
@@ -311,15 +424,20 @@ function WorkRequestsPage() {
   const [uploadRequestId, setUploadRequestId] = useState<string | null>(null);
   const [historyRequestId, setHistoryRequestId] = useState<string | null>(null);
   const [actionRequestId, setActionRequestId] = useState<string | null>(null);
+  const [previewFile, setPreviewFile] = useState<AttachmentRef | null>(null);
+  const [historyMode, setHistoryMode] = useState<"TRANSFER" | "REVISION">("TRANSFER");
+  const [detailFileSearch, setDetailFileSearch] = useState("");
+  const [detailFileType, setDetailFileType] = useState("ALL");
+  const [detailFileDate, setDetailFileDate] = useState("");
 
   const [createForm, setCreateForm] = useState({
     parentType: "BID" as "BID" | "PROJECT",
     parentId: state.projects.find((project) => project.type === "BID" && !state.workRequests.some((request) => request.parentId === project.id))?.id || "",
     title: "",
-    category: state.settings.categories[1] || state.settings.categories[0] || "General",
+    category: workRequestTypes[0] || "General",
     priority: "High" as "High" | "Medium" | "Low",
     attachmentName: "",
-    attachmentCategory: state.settings.categories[0] || "General",
+    attachmentCategory: projectInfoCategories[0] || "General",
     notes: "",
     assignedDivisionId: "div-ecm",
   });
@@ -359,6 +477,20 @@ function WorkRequestsPage() {
       setCreateForm((prev) => ({ ...prev, parentId: availableParents[0]?.id || "" }));
     }
   }, [availableParents, createForm.parentId]);
+
+  useEffect(() => {
+    if (!detailRequestId) {
+      setDetailFileSearch("");
+      setDetailFileType("ALL");
+      setDetailFileDate("");
+    }
+  }, [detailRequestId]);
+
+  useEffect(() => {
+    if (!historyRequestId) {
+      setHistoryMode("TRANSFER");
+    }
+  }, [historyRequestId]);
 
   const getCurrentMember = () => {
     if (!currentActor.memberId) return undefined;
@@ -436,6 +568,50 @@ function WorkRequestsPage() {
       case "FINAL_LIST":
         return request.currentStatus === "FORWARDED_TO_CCR" && (isWorkflowSupervisor || currentActor.role === "ccr_coordinator");
 
+      case "SEND_BACKWARD": {
+        if (!getBackwardTargetLabel(request.currentStatus)) return false;
+
+        if (isWorkflowSupervisor) return true;
+
+        if (request.currentStatus === "LEADER_ASSIGNED") {
+          return currentActor.role === "division_lead" && isDivisionLeadFor(member, request.assignedDivisionId);
+        }
+
+        if (request.currentStatus === "MEMBER_REVIEW") {
+          return currentActor.role === "division_member" && currentActor.memberId === request.assignedMemberId;
+        }
+
+        if (request.currentStatus === "FORWARDED_TO_TMS") {
+          return currentActor.role === "tms_manager";
+        }
+
+        if (request.currentStatus === "TMS_ASSIGNED" || request.currentStatus === "DRAWING_IN_PROGRESS") {
+          return currentActor.role === "tms_drawing" && currentActor.memberId === request.tmsAssignments?.drawingId;
+        }
+
+        if (request.currentStatus === "CHECKING_REVIEW") {
+          return currentActor.role === "tms_checking" && currentActor.memberId === request.tmsAssignments?.checkingId;
+        }
+
+        if (request.currentStatus === "APPROVAL_REVIEW") {
+          return currentActor.role === "tms_approval" && currentActor.memberId === request.tmsAssignments?.approvalId;
+        }
+
+        if (request.currentStatus === "RETURNED_TO_DIVISION") {
+          return currentActor.role === "division_member" && currentActor.memberId === request.assignedMemberId;
+        }
+
+        if (request.currentStatus === "DIVISION_MEMBER_APPROVED" || request.currentStatus === "DIVISION_MANAGER_APPROVED") {
+          return currentActor.role === "division_lead" && isDivisionLeadFor(member, request.originDivisionId);
+        }
+
+        if (request.currentStatus === "FORWARDED_TO_CCR") {
+          return currentActor.role === "ccr_coordinator";
+        }
+
+        return false;
+      }
+
       default:
         return false;
     }
@@ -454,6 +630,7 @@ function WorkRequestsPage() {
       "DIVISION_MANAGER_APPROVE",
       "FORWARD_TO_CCR",
       "FINAL_LIST",
+      "SEND_BACKWARD",
     ];
 
     return actions.some((action) => canPerformAction(request, action));
@@ -570,6 +747,7 @@ function WorkRequestsPage() {
     }, 120);
 
     if (routeSearch.view === "history") {
+      setHistoryMode("TRANSFER");
       setHistoryRequestId(targetRequest.id);
       return;
     }
@@ -607,10 +785,10 @@ function WorkRequestsPage() {
       parentId:
         state.projects.find((project) => project.type === "BID" && !state.workRequests.some((request) => request.parentId === project.id))?.id || "",
       title: "",
-      category: state.settings.categories[1] || state.settings.categories[0] || "General",
+      category: workRequestTypes[0] || "General",
       priority: "High",
       attachmentName: "",
-      attachmentCategory: state.settings.categories[0] || "General",
+      attachmentCategory: projectInfoCategories[0] || "General",
       notes: "",
       assignedDivisionId: "div-ecm",
     });
@@ -713,11 +891,17 @@ function WorkRequestsPage() {
   const renderFileCard = (doc: AttachmentRef) => (
     <div key={doc.id} className="rounded-xl border border-border bg-card p-4">
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-        <div>
+        <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <FileText className="h-4 w-4 text-muted-foreground" />
             <p className="font-medium text-card-foreground">{doc.name}</p>
             <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">v{doc.version || 1}</span>
+            <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+              {getFileTypeLabel(getFileTypeKey(doc))}
+            </span>
+            <span className="rounded-full bg-secondary px-2 py-0.5 text-xs font-medium text-secondary-foreground">
+              {getAttachmentFileGroup(doc) === "PRIMARY" ? "Primary" : "Workflow"}
+            </span>
           </div>
 
           <p className="mt-1 text-xs text-muted-foreground">
@@ -734,9 +918,15 @@ function WorkRequestsPage() {
           {doc.note ? <p className="mt-2 text-xs text-muted-foreground">Note: {doc.note}</p> : null}
         </div>
 
-        <Button variant="outline" size="sm" onClick={() => void downloadAttachment(doc)}>
-          <Download className="h-4 w-4" /> Download
-        </Button>
+        <div className="flex shrink-0 flex-wrap gap-2">
+          <Button variant="outline" size="sm" onClick={() => setPreviewFile(doc)}>
+            <Eye className="h-4 w-4" /> View
+          </Button>
+
+          <Button variant="outline" size="sm" onClick={() => void downloadAttachment(doc)}>
+            <Download className="h-4 w-4" /> Download
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -839,6 +1029,8 @@ function WorkRequestsPage() {
     const canOriginManager = canPerformAction(request, "DIVISION_MANAGER_APPROVE");
     const canForwardToCcr = canPerformAction(request, "FORWARD_TO_CCR");
     const canList = canPerformAction(request, "FINAL_LIST");
+    const canBackward = canPerformAction(request, "SEND_BACKWARD") && shouldShowGenericBackward(request.currentStatus);
+    const backwardTargetLabel = getBackwardTargetLabel(request.currentStatus);
 
     const hasActions =
       canAssignLeader ||
@@ -851,7 +1043,8 @@ function WorkRequestsPage() {
       canOriginMember ||
       canOriginManager ||
       canForwardToCcr ||
-      canList;
+      canList ||
+      canBackward;
 
     if (!hasActions) {
       return (
@@ -1118,6 +1311,32 @@ function WorkRequestsPage() {
           </div>
         )}
 
+        {canBackward && backwardTargetLabel ? (
+          <div className="space-y-3 rounded-xl border border-border bg-background p-4">
+            <h4 className="text-sm font-semibold text-card-foreground">Send Back / Rework</h4>
+            <p className="text-xs text-muted-foreground">
+              Return this request to <span className="font-medium text-card-foreground">{backwardTargetLabel}</span> for correction.
+            </p>
+            <textarea
+              value={reviewNote}
+              onChange={(event) => setReviewNote(event.target.value)}
+              placeholder="Backward reason is required"
+              className="h-24 w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <Button
+              variant="destructive"
+              className="w-full"
+              onClick={() => {
+                if (!reviewNote.trim()) return toast.error("Backward reason is required");
+                runWorkflowAction(request, `Sent backward to ${backwardTargetLabel}`, getDefaultActionUploadStage(request.currentStatus), () => sendBackward(request.id, reviewNote));
+              }}
+            >
+              <XCircle className="h-4 w-4" />
+              Send Back
+            </Button>
+          </div>
+        ) : null}
+
         {canList && (
           <div className="space-y-3 rounded-xl border border-border bg-background p-4">
             <h4 className="text-sm font-semibold text-card-foreground">Merge / Final HML Listing</h4>
@@ -1183,6 +1402,9 @@ function WorkRequestsPage() {
                     </span>
                   </div>
                   <h3 className="mt-2 text-sm font-semibold text-card-foreground">{request.title}</h3>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Project: <span className="font-medium text-card-foreground">{parent ? getProjectLabel(parent) : "No parent project"}</span>
+                  </p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-4 text-xs text-muted-foreground lg:justify-end">
@@ -1208,7 +1430,7 @@ function WorkRequestsPage() {
                       <Eye className="h-4 w-4" /> Details
                     </Button>
 
-                    <Button variant="outline" size="sm" onClick={() => setHistoryRequestId(request.id)}>
+                    <Button variant="outline" size="sm" onClick={() => { setHistoryMode("TRANSFER"); setHistoryRequestId(request.id); }}>
                       <History className="h-4 w-4" /> History ({request.revisionHistory.length})
                     </Button>
 
@@ -1330,10 +1552,25 @@ function WorkRequestsPage() {
               <div>
                 <label className="mb-1 block text-sm font-medium text-foreground">Title</label>
                 <input
+                  list="work-request-type-options"
                   value={createForm.title}
-                  onChange={(event) => setCreateForm((prev) => ({ ...prev, title: event.target.value }))}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setCreateForm((prev) => ({
+                      ...prev,
+                      title: value,
+                      category: workRequestTypes.includes(value) ? value : prev.category,
+                    }));
+                  }}
+                  placeholder="Select or type custom work/doc request"
                   className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                 />
+
+                <datalist id="work-request-type-options">
+                  {workRequestTypes.map((item) => (
+                    <option key={item} value={item} />
+                  ))}
+                </datalist>
               </div>
 
               <div>
@@ -1343,7 +1580,7 @@ function WorkRequestsPage() {
                   onChange={(event) => setCreateForm((prev) => ({ ...prev, category: event.target.value }))}
                   className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                 >
-                  {state.settings.categories.map((category) => (
+                  {workRequestTypes.map((category) => (
                     <option key={category} value={category}>
                       {category}
                     </option>
@@ -1367,7 +1604,7 @@ function WorkRequestsPage() {
                   onChange={(event) => setCreateForm((prev) => ({ ...prev, attachmentCategory: event.target.value }))}
                   className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                 >
-                  {state.settings.categories.map((category) => (
+                  {projectInfoCategories.map((category) => (
                     <option key={category} value={category}>
                       {category}
                     </option>
@@ -1420,6 +1657,11 @@ function WorkRequestsPage() {
                 const division = getDivision(detailRequest.assignedDivisionId);
                 const primaryFiles = parent?.initialDocuments.filter((doc) => getAttachmentFileGroup(doc) === "PRIMARY") || [];
                 const workflowFiles = parent?.initialDocuments.filter((doc) => getAttachmentFileGroup(doc) === "WORKFLOW") || [];
+                const allFiles = [...primaryFiles, ...workflowFiles];
+                const fileTypeOptions = Array.from(new Set(allFiles.map((doc) => getFileTypeKey(doc)))).sort((a, b) => a.localeCompare(b));
+                const filteredPrimaryFiles = filterAttachmentFiles(primaryFiles, detailFileSearch, detailFileType, detailFileDate);
+                const filteredWorkflowFiles = filterAttachmentFiles(workflowFiles, detailFileSearch, detailFileType, detailFileDate);
+                const hasActiveFileFilter = Boolean(detailFileSearch.trim() || detailFileType !== "ALL" || detailFileDate);
 
                 return (
                   <div className="space-y-5 py-2">
@@ -1458,16 +1700,82 @@ function WorkRequestsPage() {
                       </div>
                     </div>
 
+                    <div className="rounded-xl border border-border bg-muted/20 p-4">
+                      <div className="mb-3 flex flex-col gap-1">
+                        <h4 className="text-sm font-semibold text-card-foreground">File Filters</h4>
+                        <p className="text-xs text-muted-foreground">
+                          Search by file name, filter by uploaded file type, or filter by a specific upload date.
+                        </p>
+                      </div>
+
+                      <div className="grid gap-3 md:grid-cols-[1.4fr_0.8fr_0.8fr_auto] md:items-end">
+                        <div>
+                          <label className="mb-1 block text-xs font-medium text-muted-foreground">Search File Name</label>
+                          <div className="relative">
+                            <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                            <input
+                              value={detailFileSearch}
+                              onChange={(event) => setDetailFileSearch(event.target.value)}
+                              placeholder="Search by file name..."
+                              className="w-full rounded-lg border border-input bg-background py-2 pl-8 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="mb-1 block text-xs font-medium text-muted-foreground">File Type</label>
+                          <select
+                            value={detailFileType}
+                            onChange={(event) => setDetailFileType(event.target.value)}
+                            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                          >
+                            <option value="ALL">All Types</option>
+                            {fileTypeOptions.map((type) => (
+                              <option key={type} value={type}>
+                                {getFileTypeLabel(type)}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        <div>
+                          <label className="mb-1 block text-xs font-medium text-muted-foreground">Upload Date</label>
+                          <input
+                            type="date"
+                            value={detailFileDate}
+                            onChange={(event) => setDetailFileDate(event.target.value)}
+                            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                          />
+                        </div>
+
+                        <Button
+                          variant="outline"
+                          disabled={!hasActiveFileFilter}
+                          onClick={() => {
+                            setDetailFileSearch("");
+                            setDetailFileType("ALL");
+                            setDetailFileDate("");
+                          }}
+                        >
+                          Clear
+                        </Button>
+                      </div>
+
+                      <p className="mt-3 text-xs text-muted-foreground">
+                        Showing {filteredPrimaryFiles.length + filteredWorkflowFiles.length} of {allFiles.length} file(s)
+                      </p>
+                    </div>
+
                     <div>
                       <h4 className="text-sm font-semibold text-card-foreground">Primary File List</h4>
                       <p className="mt-1 text-xs text-muted-foreground">Original client documents uploaded by CCR / Marketing.</p>
 
                       <div className="mt-3 space-y-3">
-                        {primaryFiles.length ? (
-                          primaryFiles.map((doc) => renderFileCard(doc))
+                        {filteredPrimaryFiles.length ? (
+                          filteredPrimaryFiles.map((doc) => renderFileCard(doc))
                         ) : (
                           <div className="rounded-xl border border-dashed border-border bg-muted/20 p-4 text-sm text-muted-foreground">
-                            No primary client document uploaded yet.
+                            {hasActiveFileFilter ? "No primary client document matches this filter." : "No primary client document uploaded yet."}
                           </div>
                         )}
                       </div>
@@ -1478,11 +1786,11 @@ function WorkRequestsPage() {
                       <p className="mt-1 text-xs text-muted-foreground">Files uploaded later by client, ECM/PMO, TMS, CCR, or other authorized users.</p>
 
                       <div className="mt-3 space-y-3">
-                        {workflowFiles.length ? (
-                          workflowFiles.map((doc) => renderFileCard(doc))
+                        {filteredWorkflowFiles.length ? (
+                          filteredWorkflowFiles.map((doc) => renderFileCard(doc))
                         ) : (
                           <div className="rounded-xl border border-dashed border-border bg-muted/20 p-4 text-sm text-muted-foreground">
-                            No workflow collaboration file uploaded yet.
+                            {hasActiveFileFilter ? "No workflow collaboration file matches this filter." : "No workflow collaboration file uploaded yet."}
                           </div>
                         )}
                       </div>
@@ -1491,6 +1799,94 @@ function WorkRequestsPage() {
                 );
               })()
             : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!previewFile} onOpenChange={() => setPreviewFile(null)}>
+        <DialogContent className="max-h-[90vh] max-w-4xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>File Preview</DialogTitle>
+          </DialogHeader>
+
+          {previewFile ? (
+            <div className="space-y-4 py-2">
+              <div className="grid gap-3 rounded-xl border border-border bg-muted/20 p-4 text-sm md:grid-cols-3">
+                <div>
+                  <p className="text-xs text-muted-foreground">Name</p>
+                  <p className="font-medium text-foreground">{previewFile.name}</p>
+                </div>
+
+                <div>
+                  <p className="text-xs text-muted-foreground">Version</p>
+                  <p className="font-medium text-foreground">v{previewFile.version || 1}</p>
+                </div>
+
+                <div>
+                  <p className="text-xs text-muted-foreground">File Type</p>
+                  <p className="font-medium text-foreground">{getFileTypeLabel(getFileTypeKey(previewFile))}</p>
+                </div>
+
+                <div>
+                  <p className="text-xs text-muted-foreground">Category</p>
+                  <p className="font-medium text-foreground">{previewFile.category}</p>
+                </div>
+
+                <div>
+                  <p className="text-xs text-muted-foreground">Uploaded By</p>
+                  <p className="font-medium text-foreground">{previewFile.uploadedBy}</p>
+                </div>
+
+                <div>
+                  <p className="text-xs text-muted-foreground">Uploaded At</p>
+                  <p className="font-medium text-foreground">{formatDate(previewFile.uploadedAt)}</p>
+                </div>
+              </div>
+
+              {previewFile.fileDataUrl && isImageFile(previewFile) ? (
+                <div className="rounded-xl border border-border bg-muted/20 p-3">
+                  <img src={previewFile.fileDataUrl} alt={previewFile.name} className="max-h-[60vh] w-full rounded-lg object-contain" />
+                </div>
+              ) : null}
+
+              {previewFile.fileDataUrl && isPdfFile(previewFile) ? (
+                <div className="overflow-hidden rounded-xl border border-border bg-muted/20">
+                  <iframe src={previewFile.fileDataUrl} title={previewFile.name} className="h-[65vh] w-full" />
+                </div>
+              ) : null}
+
+              {previewFile.textContent ? (
+                <div className="rounded-xl border border-border bg-muted/20 p-4">
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Text Content</p>
+                  <pre className="whitespace-pre-wrap text-sm text-card-foreground">{previewFile.textContent}</pre>
+                </div>
+              ) : null}
+
+              {previewFile.fileDataUrl && !isImageFile(previewFile) && !isPdfFile(previewFile) && !previewFile.textContent ? (
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
+                  Preview is not available for this file type. Please download the file to view it.
+                </div>
+              ) : null}
+
+              {!previewFile.fileDataUrl && !previewFile.textContent ? (
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
+                  Preview is not available for this older/demo metadata file. You can still download its metadata.
+                </div>
+              ) : null}
+
+              {previewFile.note ? (
+                <div className="rounded-xl border border-border bg-muted/20 p-4 text-sm text-muted-foreground">
+                  <span className="font-medium text-card-foreground">Note:</span> {previewFile.note}
+                </div>
+              ) : null}
+
+              <div className="flex justify-end">
+                <Button onClick={() => void downloadAttachment(previewFile)}>
+                  <Download className="h-4 w-4" />
+                  Download
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </DialogContent>
       </Dialog>
 
@@ -1657,37 +2053,126 @@ function WorkRequestsPage() {
       </Dialog>
 
       <Dialog open={!!historyRequest} onOpenChange={() => setHistoryRequestId(null)}>
-        <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
+        <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Revision / Transfer History</DialogTitle>
+            <DialogTitle>History</DialogTitle>
           </DialogHeader>
 
-          {historyRequest ? (
-            <div className="space-y-0 py-2">
-              {[...historyRequest.revisionHistory].reverse().map((entry, index, list) => (
-                <div key={entry.id} className="relative flex gap-4 pb-6 last:pb-0">
-                  <div className="relative flex w-4 justify-center">
-                    <span className="mt-1 h-2.5 w-2.5 rounded-full bg-primary" />
-                    {index < list.length - 1 ? <span className="absolute left-1/2 top-5 h-[calc(100%-0.5rem)] w-px -translate-x-1/2 bg-border" /> : null}
+          {historyRequest
+            ? (() => {
+                const parent = getProject(historyRequest.parentId);
+                const relatedFiles = parent?.initialDocuments.filter((doc) => getAttachmentFileGroup(doc) === "WORKFLOW") || [];
+                const revisionGroups = getDocumentRevisionGroups(relatedFiles);
+
+                return (
+                  <div className="space-y-4 py-2">
+                    <div className="flex flex-wrap gap-3 rounded-xl border border-border bg-muted/20 p-3">
+                      <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-card-foreground">
+                        <input
+                          type="radio"
+                          checked={historyMode === "TRANSFER"}
+                          onChange={() => setHistoryMode("TRANSFER")}
+                        />
+                        Transfer History
+                      </label>
+
+                      <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-card-foreground">
+                        <input
+                          type="radio"
+                          checked={historyMode === "REVISION"}
+                          onChange={() => setHistoryMode("REVISION")}
+                        />
+                        Revision History
+                      </label>
+                    </div>
+
+                    {historyMode === "TRANSFER" ? (
+                      <div className="space-y-0">
+                        {[...historyRequest.revisionHistory].reverse().map((entry, index, list) => (
+                          <div key={entry.id} className="relative flex gap-4 pb-6 last:pb-0">
+                            <div className="relative flex w-4 justify-center">
+                              <span className="mt-1 h-2.5 w-2.5 rounded-full bg-primary" />
+                              {index < list.length - 1 ? <span className="absolute left-1/2 top-5 h-[calc(100%-0.5rem)] w-px -translate-x-1/2 bg-border" /> : null}
+                            </div>
+                            <div>
+                              <h4 className="font-semibold text-card-foreground">{entry.action}</h4>
+                              <p className="mt-1 text-sm text-muted-foreground">
+                                {entry.by}
+                                {entry.to ? (
+                                  <>
+                                    {" "}
+                                    <ArrowRight className="mx-1 inline h-3 w-3" /> {entry.to}
+                                  </>
+                                ) : null}
+                              </p>
+                              <p className="text-xs text-muted-foreground">{formatDate(entry.at)}</p>
+                              {entry.note ? <p className="mt-2 text-sm text-muted-foreground">“{entry.note}”</p> : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        <div className="rounded-xl border border-border bg-muted/20 p-4">
+                          <h4 className="text-sm font-semibold text-card-foreground">Document Revision History</h4>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Files are grouped by file name. Re-uploading the same file name creates the next version.
+                          </p>
+                        </div>
+
+                        {revisionGroups.length ? (
+                          revisionGroups.map((group) => (
+                            <div key={group.key} className="rounded-xl border border-border bg-card p-4">
+                              <div className="mb-3 flex flex-wrap items-center gap-2">
+                                <FileText className="h-4 w-4 text-muted-foreground" />
+                                <h4 className="font-semibold text-card-foreground">{group.name}</h4>
+                                <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                                  {group.revisions.length} revision{group.revisions.length === 1 ? "" : "s"}
+                                </span>
+                              </div>
+
+                              <div className="space-y-3">
+                                {group.revisions.map((doc, index) => (
+                                  <div key={doc.id} className="relative flex gap-3 rounded-lg border border-border bg-muted/20 p-3">
+                                    <div className="flex h-8 min-w-8 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">
+                                      v{doc.version || index + 1}
+                                    </div>
+                                    <div className="min-w-0 flex-1">
+                                      <p className="text-sm font-medium text-card-foreground">{doc.name}</p>
+                                      <p className="mt-1 text-xs text-muted-foreground">
+                                        {doc.category} · {doc.workflowStage || "Workflow Collaboration"} · Uploaded by {doc.uploadedBy} · {formatDate(doc.uploadedAt)}
+                                      </p>
+                                      {doc.fileName ? (
+                                        <p className="mt-1 text-xs text-muted-foreground">
+                                          File: {doc.fileName} · {getFileTypeLabel(getFileTypeKey(doc))} · {formatFileSize(doc.fileSize)}
+                                        </p>
+                                      ) : null}
+                                      {doc.note ? <p className="mt-2 text-xs text-muted-foreground">Note: {doc.note}</p> : null}
+                                    </div>
+                                    <div className="flex shrink-0 flex-wrap gap-2">
+                                      <Button variant="outline" size="sm" onClick={() => setPreviewFile(doc)}>
+                                        <Eye className="h-4 w-4" /> View
+                                      </Button>
+                                      <Button variant="outline" size="sm" onClick={() => void downloadAttachment(doc)}>
+                                        <Download className="h-4 w-4" /> Download
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="rounded-xl border border-dashed border-border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
+                            No workflow document revision has been uploaded yet.
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <div>
-                    <h4 className="font-semibold text-card-foreground">{entry.action}</h4>
-                    <p className="mt-1 text-sm text-muted-foreground">
-                      {entry.by}
-                      {entry.to ? (
-                        <>
-                          {" "}
-                          <ArrowRight className="mx-1 inline h-3 w-3" /> {entry.to}
-                        </>
-                      ) : null}
-                    </p>
-                    <p className="text-xs text-muted-foreground">{formatDate(entry.at)}</p>
-                    {entry.note ? <p className="mt-2 text-sm text-muted-foreground">“{entry.note}”</p> : null}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : null}
+                );
+              })()
+            : null}
         </DialogContent>
       </Dialog>
 
@@ -1739,6 +2224,7 @@ function WorkRequestsPage() {
     </div>
   );
 }
+
 
 // import { createFileRoute } from "@tanstack/react-router";
 // import { useEffect, useMemo, useState } from "react";
@@ -2122,10 +2608,10 @@ function WorkRequestsPage() {
 //     parentType: "BID" as "BID" | "PROJECT",
 //     parentId: state.projects.find((project) => project.type === "BID")?.id || state.projects[0]?.id || "",
 //     title: "",
-//     category: state.settings.categories[1] || state.settings.categories[0] || "General",
+//     category: workRequestTypes[0] || "General",
 //     priority: "High" as "High" | "Medium" | "Low",
 //     attachmentName: "",
-//     attachmentCategory: state.settings.categories[0] || "General",
+//     attachmentCategory: projectInfoCategories[0] || "General",
 //     notes: "",
 //     assignedDivisionId: "div-ecm",
 //   });
@@ -2365,10 +2851,10 @@ function WorkRequestsPage() {
 //       parentType: "BID",
 //       parentId: state.projects.find((project) => project.type === "BID")?.id || state.projects[0]?.id || "",
 //       title: "",
-//       category: state.settings.categories[1] || state.settings.categories[0] || "General",
+//       category: workRequestTypes[0] || "General",
 //       priority: "High",
 //       attachmentName: "",
-//       attachmentCategory: state.settings.categories[0] || "General",
+//       attachmentCategory: projectInfoCategories[0] || "General",
 //       notes: "",
 //       assignedDivisionId: "div-ecm",
 //     });

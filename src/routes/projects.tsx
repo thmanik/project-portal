@@ -5,9 +5,9 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Progress } from "@/components/ui/progress";
-import { Download, Edit, Eye, FileText, Filter, Mail, MoreHorizontal, Paperclip, Plus, Search, Trash2, Upload } from "lucide-react";
+import { CheckCircle2, Download, Edit, Eye, FileText, Filter, Mail, MoreHorizontal, Paperclip, Plus, Search, Trash2, Upload, XCircle } from "lucide-react";
 import { toast } from "sonner";
-import { actorCanManageProjects, formatDate, type AttachmentInput, type AttachmentRef, type ProjectItem, usePortal } from "@/lib/portal-data";
+import { actorCanManageProjects, formatDate, type AttachmentInput, type AttachmentRef, type ProjectItem, type WorkRequest, usePortal } from "@/lib/portal-data";
 
 export const Route = createFileRoute("/projects")({
   component: ProjectsPage,
@@ -16,7 +16,7 @@ export const Route = createFileRoute("/projects")({
   }),
 });
 
-type TypeFilter = "ALL" | "BID" | "PROJECT";
+type TypeFilter = "ALL" | "BID" | "PROJECT" | "ARCHIVE";
 type StatusFilter = "ALL" | ProjectItem["status"];
 type DocumentFormRow = AttachmentInput;
 
@@ -63,10 +63,16 @@ function formatFileSize(size?: number) {
   return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function projectProgress(project: ProjectItem, workRequestCount: number) {
+function hasFinalHmlListing(relatedRequests: WorkRequest[]) {
+  return relatedRequests.some((request) => request.currentStatus === "HML_LISTED");
+}
+
+function projectProgress(project: ProjectItem, relatedRequests: WorkRequest[]) {
+  if (project.status === "ARCHIVED") return 100;
   if (project.status === "COMPLETED") return 100;
-  if (project.status === "ACTIVE") return Math.min(90, 60 + workRequestCount * 5);
-  if (project.status === "BIDDING") return Math.min(70, 45 + workRequestCount * 3);
+  if (project.type === "BID" && hasFinalHmlListing(relatedRequests)) return 100;
+  if (project.status === "ACTIVE") return Math.min(90, 60 + relatedRequests.length * 5);
+  if (project.status === "BIDDING") return Math.min(70, 45 + relatedRequests.length * 3);
   return 10;
 }
 
@@ -74,6 +80,7 @@ function projectStatusLabel(status: ProjectItem["status"]) {
   if (status === "DRAFT") return "Pending";
   if (status === "BIDDING") return "Active";
   if (status === "ACTIVE") return "In Progress";
+  if (status === "ARCHIVED") return "Archived";
   return "Completed";
 }
 
@@ -81,6 +88,18 @@ function projectStatusClass(status: ProjectItem["status"]) {
   if (status === "DRAFT") return "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300";
   if (status === "BIDDING") return "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300";
   if (status === "ACTIVE") return "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300";
+  if (status === "ARCHIVED") return "bg-slate-200 text-slate-700 dark:bg-slate-500/20 dark:text-slate-300";
+  return "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300";
+}
+
+function projectRecordLabel(project: ProjectItem) {
+  if (project.status === "ARCHIVED") return "Archive";
+  return project.type === "BID" ? "Bid" : "Project";
+}
+
+function projectRecordClass(project: ProjectItem) {
+  if (project.status === "ARCHIVED") return "bg-slate-100 text-slate-700 dark:bg-slate-500/15 dark:text-slate-300";
+  if (project.type === "BID") return "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300";
   return "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300";
 }
 
@@ -156,7 +175,7 @@ async function downloadAttachment(doc: AttachmentRef) {
 }
 
 function ProjectsPage() {
-  const { state, currentActor, addProject, addClientDocument } = usePortal();
+  const { state, currentActor, addProject, addClientDocument, decideBidOutcome } = usePortal();
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<TypeFilter>("ALL");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
@@ -188,8 +207,12 @@ function ProjectsPage() {
       list = list.filter((project) => project.clientId === currentActor.clientId);
     }
 
-    if (typeFilter !== "ALL") {
-      list = list.filter((project) => project.type === typeFilter);
+    if (typeFilter === "ARCHIVE") {
+      list = list.filter((project) => project.status === "ARCHIVED");
+    } else if (typeFilter === "BID") {
+      list = list.filter((project) => project.type === "BID" && project.status !== "ARCHIVED");
+    } else if (typeFilter === "PROJECT") {
+      list = list.filter((project) => project.type === "PROJECT" && project.status !== "ARCHIVED");
     }
 
     if (statusFilter !== "ALL") {
@@ -350,6 +373,7 @@ function ProjectsPage() {
             <DropdownMenuItem onSelect={() => setStatusFilter("ACTIVE")}>In Progress</DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setStatusFilter("DRAFT")}>Pending</DropdownMenuItem>
             <DropdownMenuItem onSelect={() => setStatusFilter("COMPLETED")}>Completed</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => setStatusFilter("ARCHIVED")}>Archived</DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
 
@@ -358,6 +382,7 @@ function ProjectsPage() {
             { label: "All", value: "ALL" as const },
             { label: "Bids", value: "BID" as const },
             { label: "Projects", value: "PROJECT" as const },
+            { label: "Archive", value: "ARCHIVE" as const },
           ].map((item) => (
             <button
               key={item.value}
@@ -392,8 +417,10 @@ function ProjectsPage() {
             <tbody className="divide-y divide-border">
               {visibleProjects.map((project) => {
                 const client = state.clients.find((item) => item.id === project.clientId);
-                const workRequestCount = state.workRequests.filter((request) => request.parentId === project.id).length;
-                const progress = projectProgress(project, workRequestCount);
+                const relatedWorkRequests = state.workRequests.filter((request) => request.parentId === project.id);
+                const workRequestCount = relatedWorkRequests.length;
+                const progress = projectProgress(project, relatedWorkRequests);
+                const canDecideBidOutcome = canManage && project.type === "BID" && project.status !== "ARCHIVED" && hasFinalHmlListing(relatedWorkRequests);
 
                 return (
                   <tr key={project.id} className="bg-card transition-colors hover:bg-muted/30">
@@ -412,8 +439,8 @@ function ProjectsPage() {
                     </td>
 
                     <td className="px-5 py-4 align-top">
-                      <span className="inline-flex rounded-md bg-blue-100 px-2 py-1 text-xs font-medium text-blue-700 dark:bg-blue-500/15 dark:text-blue-300">
-                        {project.type === "BID" ? "Bid" : "Project"}
+                      <span className={`inline-flex rounded-md px-2 py-1 text-xs font-medium ${projectRecordClass(project)}`}>
+                        {projectRecordLabel(project)}
                       </span>
                     </td>
 
@@ -435,6 +462,41 @@ function ProjectsPage() {
                     <td className="px-5 py-4 align-top text-muted-foreground">{formatShortDate(project.createdAt)}</td>
 
                     <td className="px-5 py-4 align-top text-right">
+                      <div className="flex flex-wrap items-center justify-end gap-2">
+                        {canDecideBidOutcome ? (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 border-emerald-200 text-xs text-emerald-700 hover:bg-emerald-50 dark:border-emerald-500/30 dark:text-emerald-300 dark:hover:bg-emerald-500/10"
+                              onClick={() => {
+                                decideBidOutcome(project.id, "WIN");
+                                toast.success("Bid marked as won", {
+                                  description: `${project.code} moved to Projects.`,
+                                });
+                              }}
+                            >
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                              Bid Win
+                            </Button>
+
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8 border-destructive/30 text-xs text-destructive hover:bg-destructive/10"
+                              onClick={() => {
+                                decideBidOutcome(project.id, "LOSE");
+                                toast.success("Bid archived", {
+                                  description: `${project.code} moved to Archive.`,
+                                });
+                              }}
+                            >
+                              <XCircle className="h-3.5 w-3.5" />
+                              Bid Lose
+                            </Button>
+                          </>
+                        ) : null}
+
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
                           <Button variant="ghost" size="icon" className="h-8 w-8">
@@ -462,6 +524,7 @@ function ProjectsPage() {
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
+                      </div>
                     </td>
                   </tr>
                 );
@@ -771,7 +834,7 @@ function ProjectsPage() {
                 </div>
                 <div>
                   <p className="text-xs text-muted-foreground">Type</p>
-                  <p className="font-medium text-foreground">{viewProject.type === "BID" ? "Bid" : "Project"}</p>
+                  <p className="font-medium text-foreground">{projectRecordLabel(viewProject)}</p>
                 </div>
                 <div>
                   <p className="text-xs text-muted-foreground">Status</p>

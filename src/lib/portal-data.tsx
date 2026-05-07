@@ -104,7 +104,7 @@ export interface ProjectItem {
   clientEmail: string;
   originDivisionId: string;
   sourceChannel: string;
-  status: "DRAFT" | "BIDDING" | "ACTIVE" | "COMPLETED";
+  status: "DRAFT" | "BIDDING" | "ACTIVE" | "COMPLETED" | "ARCHIVED";
   initialDocuments: AttachmentRef[];
   credentialsSent: boolean;
   createdAt: string;
@@ -178,8 +178,9 @@ export interface RegistryDocument {
 export interface PortalSettings {
   portalName: string;
   categories: string[];
+  workRequestTypes?: string[];
+  projectInfoCategories?: string[];
 }
-
 export interface PortalState {
   companies: Company[];
   divisions: Division[];
@@ -226,7 +227,9 @@ interface PortalContextValue {
   originMemberDecision: (workRequestId: string, approved: boolean, note?: string) => void;
   originManagerApprove: (workRequestId: string, note?: string) => void;
   forwardToCcr: (workRequestId: string, note?: string) => void;
+  sendBackward: (workRequestId: string, note?: string) => void;
   listFinalDocument: (workRequestId: string, payload: { name: string; category: string }) => void;
+  decideBidOutcome: (projectId: string, outcome: "WIN" | "LOSE") => void;
   updateSettings: (payload: Partial<PortalSettings>) => void;
 }
 
@@ -456,7 +459,18 @@ function createSeedState(): PortalState {
     documents: [],
     settings: {
       portalName: "Project Management Portal",
-      categories: ["Client Request", "Stowage Plan", "Voyage Condition", "Port Fee", "Engineering", "General"],
+      categories: ["Client Request", "Engineering", "General"],
+      workRequestTypes: [
+        "Stowage Plan",
+        "Voyage Condition",
+        "Mooring Plan",
+        "Mooring Analysis",
+        "Grillade & Sea-Fastening Plan",
+        "Berthing Feasibility",
+        "Loadout Feasibility",
+        "Motion Analysis",
+      ],
+      projectInfoCategories: ["Cargo Info", "Port Info", "SPMT Info", "Vessel info", "General info"],
     },
   };
 }
@@ -870,6 +884,40 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
     [actorLabel, divisionName, pushHistory, updateRequest]
   );
 
+  const sendBackward = useCallback(
+    (workRequestId: string, note?: string) => {
+      updateRequest(workRequestId, (request) => {
+        const backwardMap: Partial<Record<WorkRequestStatus, { status: WorkRequestStatus; label: string; to?: string }>> = {
+          LEADER_ASSIGNED: { status: "DIVISION_NOTIFIED", label: "Division Notified", to: divisionName(request.assignedDivisionId) },
+          MEMBER_REVIEW: { status: "LEADER_ASSIGNED", label: "Division Lead Assignment", to: memberName(request.assignedLeaderId) },
+          FORWARDED_TO_TMS: { status: "MEMBER_REVIEW", label: "Division Member Review", to: memberName(request.assignedMemberId) },
+          TMS_ASSIGNED: { status: "FORWARDED_TO_TMS", label: "TMS Manager Intake", to: "TMS Manager" },
+          DRAWING_IN_PROGRESS: { status: "TMS_ASSIGNED", label: "TMS Chain Assignment", to: "TMS Manager" },
+          CHECKING_REVIEW: { status: "DRAWING_IN_PROGRESS", label: "TMS-M1 Drawing Rework", to: memberName(request.tmsAssignments?.drawingId) },
+          APPROVAL_REVIEW: { status: "CHECKING_REVIEW", label: "TMS-M2 Checking Rework", to: memberName(request.tmsAssignments?.checkingId) },
+          RETURNED_TO_DIVISION: { status: "APPROVAL_REVIEW", label: "TMS-M3 Approval Rework", to: memberName(request.tmsAssignments?.approvalId) },
+          DIVISION_MEMBER_APPROVED: { status: "RETURNED_TO_DIVISION", label: "Division Member Final Review", to: memberName(request.assignedMemberId) },
+          DIVISION_MANAGER_APPROVED: { status: "DIVISION_MEMBER_APPROVED", label: "Division Member Approved Stage", to: memberName(request.assignedMemberId) },
+          FORWARDED_TO_CCR: { status: "DIVISION_MANAGER_APPROVED", label: "Division Manager Approval", to: divisionName(request.originDivisionId) },
+        };
+
+        const target = backwardMap[request.currentStatus];
+        if (!target) return;
+
+        const previousStatus = request.currentStatus;
+        request.currentStatus = target.status;
+        pushHistory(request, {
+          by: actorLabel(),
+          action: `Sent backward from ${getWorkRequestStatusLabel(previousStatus)} to ${target.label}.`,
+          from: getWorkRequestStatusLabel(previousStatus),
+          to: target.to || target.label,
+          note,
+        });
+      });
+    },
+    [actorLabel, divisionName, memberName, pushHistory, updateRequest]
+  );
+
   const listFinalDocument = useCallback(
     (workRequestId: string, payload: { name: string; category: string }) => {
       setState((prev) => {
@@ -898,24 +946,54 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
           listedBy: actorLabel(),
         });
 
-        const parentProject = next.projects.find((project) => project.id === request.parentId);
+        return next;
+      });
+    },
+    [actorLabel]
+  );
 
-        if (parentProject?.type === "BID") {
-          parentProject.type = "PROJECT";
-          parentProject.status = "ACTIVE";
-          parentProject.code = parentProject.code.startsWith("BID-")
-            ? parentProject.code.replace("BID-", "PRJ-")
-            : `PRJ-${26000 + next.projects.filter((project) => project.type === "PROJECT").length + 1}`;
+  const decideBidOutcome = useCallback(
+    (projectId: string, outcome: "WIN" | "LOSE") => {
+      setState((prev) => {
+        const next = clone(prev);
+        const project = next.projects.find((item) => item.id === projectId);
+        if (!project || project.type !== "BID") return prev;
 
-          request.parentType = "PROJECT";
+        const relatedRequests = next.workRequests.filter((request) => request.parentId === project.id);
+        const bidIsReady = relatedRequests.some((request) => request.currentStatus === "HML_LISTED");
+        if (!bidIsReady) return prev;
 
-          request.revisionHistory.unshift({
-            id: uid("hist"),
-            at: now(),
-            by: "System",
-            action: `Bid converted to Project after final HML listing.`,
-            from: "BID",
-            to: parentProject.code,
+        if (outcome === "WIN") {
+          const previousCode = project.code;
+          project.type = "PROJECT";
+          project.status = "ACTIVE";
+          project.code = previousCode.startsWith("BID-")
+            ? previousCode.replace("BID-", "PRJ-")
+            : `PRJ-${26000 + next.projects.filter((item) => item.type === "PROJECT").length + 1}`;
+
+          relatedRequests.forEach((request) => {
+            request.parentType = "PROJECT";
+            request.revisionHistory.unshift({
+              id: uid("hist"),
+              at: now(),
+              by: actorLabel(),
+              action: `Bid marked as won and converted from ${previousCode} to ${project.code}.`,
+              from: previousCode,
+              to: project.code,
+            });
+          });
+        } else {
+          project.status = "ARCHIVED";
+
+          relatedRequests.forEach((request) => {
+            request.revisionHistory.unshift({
+              id: uid("hist"),
+              at: now(),
+              by: actorLabel(),
+              action: `Bid marked as lost and moved to archive.`,
+              from: project.code,
+              to: "Archive",
+            });
           });
         }
 
@@ -952,7 +1030,9 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       originMemberDecision,
       originManagerApprove,
       forwardToCcr,
+      sendBackward,
       listFinalDocument,
+      decideBidOutcome,
       updateSettings,
     }),
     [
@@ -977,7 +1057,9 @@ export function PortalDataProvider({ children }: { children: React.ReactNode }) 
       originMemberDecision,
       originManagerApprove,
       forwardToCcr,
+      sendBackward,
       listFinalDocument,
+      decideBidOutcome,
       updateSettings,
     ]
   );
@@ -1055,6 +1137,7 @@ export function belongsToDivision(member: Member | undefined, divisionId: string
 export function formatDate(value: string) {
   return fmt(value);
 }
+
 
 
 
